@@ -9,7 +9,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         submodules: 'recursive'
         fetch-depth: '0'
@@ -156,15 +156,31 @@ jobs:
         out-file-path: V2rayNG/app/libs/
 
     - name: Setup Java
-      uses: actions/setup-java@v4
+      uses: actions/setup-java@v6.3.0
       with:
         distribution: 'temurin'
         java-version: '21'
 
-    - name: Decode keystore
+    - name: Decode and check keystore
       env:
         KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-      run: echo "$KEYSTORE_B64" | base64 -d > $RUNNER_TEMP/release.jks
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      run: |
+        PASS=$(printf '%s' "$KEYSTORE_PASSWORD" | tr -d ' \r\n\t')
+        echo "::add-mask::$PASS"
+        printf '%s' "$KEYSTORE_B64" | tr -d ' \r\n\t' | base64 -d > $RUNNER_TEMP/release.p12
+        echo "Keystore size: $(stat -c %s $RUNNER_TEMP/release.p12) bytes (expected 2570)"
+        echo "Password length: ${#PASS} (expected 20)"
+        if ! keytool -list -keystore $RUNNER_TEMP/release.p12 -storetype PKCS12 -storepass "$PASS" -alias hshukur; then
+          echo "::error::KEYSTORE_B64 or KEYSTORE_PASSWORD secret is wrong - paste them again"
+          exit 1
+        fi
+        # convert to classic JKS so the Android signer reads it without guessing the type
+        keytool -importkeystore -noprompt \
+          -srckeystore $RUNNER_TEMP/release.p12 -srcstoretype PKCS12 -srcstorepass "$PASS" \
+          -destkeystore $RUNNER_TEMP/release.jks -deststoretype JKS -deststorepass "$PASS" -destkeypass "$PASS" \
+          -srcalias hshukur -destalias hshukur
+        echo "SIGN_PASS=$PASS" >> $GITHUB_ENV
 
     - name: Build APK
       run: |
@@ -173,15 +189,15 @@ jobs:
         chmod 755 gradlew
         ./gradlew assemblePlaystoreRelease \
           -Pandroid.injected.signing.store.file=$RUNNER_TEMP/release.jks \
-          -Pandroid.injected.signing.store.password='${{ secrets.KEYSTORE_PASSWORD }}' \
+          -Pandroid.injected.signing.store.password="$SIGN_PASS" \
           -Pandroid.injected.signing.key.alias=hshukur \
-          -Pandroid.injected.signing.key.password='${{ secrets.KEYSTORE_PASSWORD }}'
+          -Pandroid.injected.signing.key.password="$SIGN_PASS"
         mkdir -p $RUNNER_TEMP/out
         cp app/build/outputs/apk/playstore/release/*universal*.apk $RUNNER_TEMP/out/hshukurvpn-universal.apk
         cp app/build/outputs/apk/playstore/release/*arm64-v8a*.apk $RUNNER_TEMP/out/hshukurvpn-arm64.apk
 
     - name: Upload APK
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: hshukurvpn
         path: ${{ runner.temp }}/out/*.apk
