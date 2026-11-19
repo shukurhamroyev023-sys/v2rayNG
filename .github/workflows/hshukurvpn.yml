@@ -1,0 +1,188 @@
+name: Build hshukurvpn
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive'
+        fetch-depth: '0'
+
+    - name: Customize app (name, icon, embedded server)
+      env:
+        VPN_LINK: ${{ secrets.VPN_LINK }}
+      run: |
+        pip install --quiet pillow
+        python3 - <<'PY'
+        import os, re
+        from pathlib import Path
+        from PIL import Image, ImageDraw
+
+        APP_NAME = "hshukurvpn"
+        APP_ID = "com.v2ray.ang.hshukur"
+        app = Path("V2rayNG/app")
+        main = app / "src/main"
+
+        # 1. App name (main + every language)
+        for s in (main / "res").glob("values*/strings.xml"):
+            t = s.read_text(encoding="utf-8")
+            t = re.sub(r'(<string name="app_name"[^>]*>)[^<]*(</string>)', r"\g<1>" + APP_NAME + r"\g<2>", t, count=1)
+            s.write_text(t, encoding="utf-8")
+
+        # 2. Package id (own app, installs next to the original v2rayNG)
+        g = app / "build.gradle.kts"
+        t = g.read_text(encoding="utf-8")
+        t = t.replace('applicationId = "com.v2ray.ang"', f'applicationId = "{APP_ID}"', 1)
+        g.write_text(t, encoding="utf-8")
+
+        # 3. Icon from icon.png in the repo root
+        src = Image.open("icon.png").convert("RGB")
+        w, h = src.size
+        side = min(w, h)
+        src = src.crop(((w - side) // 2, (h - side) // 2, (w + side) // 2, (h + side) // 2))
+
+        def masked(size, radius_ratio):
+            img = src.resize((size, size), Image.LANCZOS).convert("RGBA")
+            mask = Image.new("L", (size * 4, size * 4), 0)
+            ImageDraw.Draw(mask).rounded_rectangle((0, 0, size * 4 - 1, size * 4 - 1), radius=int(size * 4 * radius_ratio), fill=255)
+            img.putalpha(mask.resize((size, size), Image.LANCZOS))
+            return img
+
+        dens = {"mdpi": 1, "hdpi": 1.5, "xhdpi": 2, "xxhdpi": 3, "xxxhdpi": 4}
+        for d, k in dens.items():
+            folder = main / f"res/mipmap-{d}"
+            folder.mkdir(parents=True, exist_ok=True)
+            fg = int(108 * k)
+            src.resize((fg, fg), Image.LANCZOS).save(folder / "ic_launcher_foreground.png")
+            lg = int(48 * k)
+            masked(lg, 0.22).save(folder / "ic_launcher.png")
+            masked(lg, 0.5).save(folder / "ic_launcher_round.png")
+
+        x = main / "res/mipmap-anydpi-v26/ic_launcher.xml"
+        t = x.read_text(encoding="utf-8")
+        t = re.sub(r"\s*<monochrome[^>]*/>", "", t)
+        x.write_text(t, encoding="utf-8")
+
+        # 4. Embedded server link (comes from the VPN_LINK secret, never stored in the repo)
+        raw = main / "res/raw"
+        raw.mkdir(parents=True, exist_ok=True)
+        (raw / "embedded_config.txt").write_text(os.environ.get("VPN_LINK", "").strip() + "\n", encoding="utf-8")
+
+        ma = main / "java/com/v2ray/ang/ui/main/MainActivity.kt"
+        t = ma.read_text(encoding="utf-8")
+        call = "        super.onCreate(savedInstanceState)\n        importEmbeddedConfigIfNeeded()\n"
+        assert "        super.onCreate(savedInstanceState)\n" in t, "onCreate not found"
+        t = t.replace("        super.onCreate(savedInstanceState)\n", call, 1)
+        method = '''
+            private fun importEmbeddedConfigIfNeeded() {
+                try {
+                    if (!MmkvManager.decodeSettingsBool("hshukur_defaults_applied", false)) {
+                        // First launch: VPN only for TikTok (can be switched off in "Per-app proxy")
+                        MmkvManager.encodeSettings(AppConfig.PREF_PER_APP_PROXY, true)
+                        MmkvManager.encodeSettings(AppConfig.PREF_BYPASS_APPS, false)
+                        MmkvManager.encodeSettings(
+                            AppConfig.PREF_PER_APP_PROXY_SET,
+                            mutableSetOf(
+                                "com.zhiliaoapp.musically",
+                                "com.ss.android.ugc.trill",
+                                "com.zhiliaoapp.musically.go"
+                            )
+                        )
+                        MmkvManager.encodeSettings("hshukur_defaults_applied", true)
+                    }
+                    if (MmkvManager.decodeAllServerList().isNotEmpty()) return
+                    val text = resources.openRawResource(R.raw.embedded_config)
+                        .bufferedReader().use { it.readText() }.trim()
+                    if (text.isEmpty()) return
+                    AngConfigManager.importBatchConfig(text, AppConfig.DEFAULT_SUBSCRIPTION_ID, true)
+                    MmkvManager.decodeAllServerList().firstOrNull()?.let { MmkvManager.setSelectServer(it) }
+                } catch (e: Exception) {
+                    LogUtil.e(AppConfig.TAG, "Embedded config import failed", e)
+                }
+            }
+
+        '''
+        import textwrap
+        method = textwrap.indent(textwrap.dedent(method).strip("\n"), "    ") + "\n\n"
+        anchor = "    override fun onCreate(savedInstanceState: Bundle?) {"
+        assert anchor in t, "onCreate signature not found"
+        t = t.replace(anchor, method + anchor, 1)
+        ma.write_text(t, encoding="utf-8")
+        print("Customization done")
+        PY
+        test -n "$VPN_LINK" || echo "::warning::VPN_LINK secret is empty - the app will start without a server"
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        log-accepted-android-sdk-licenses: false
+        cmdline-tools-version: '14742923'
+        packages: 'platforms;android-37.0 build-tools;37.0.0 platform-tools'
+
+    - name: Install NDK
+      run: |
+        echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager \
+          --channel=0 \
+          --install "ndk;30.0.16248370"
+        echo "NDK_HOME=$ANDROID_HOME/ndk/30.0.16248370" >> $GITHUB_ENV
+        sed -i '10i\
+        \
+            ndkVersion = "30.0.16248370"' ${{ github.workspace }}/V2rayNG/app/build.gradle.kts
+
+    - name: Build libhevtun
+      run: |
+        bash compile-hevtun.sh
+        cp -r ${{ github.workspace }}/libs ${{ github.workspace }}/V2rayNG/app
+
+    - name: Fetch AndroidLibXrayLite tag
+      run: |
+        pushd AndroidLibXrayLite
+        CURRENT_TAG=$(git describe --tags --abbrev=0)
+        echo "CURRENT_TAG=$CURRENT_TAG" >> $GITHUB_ENV
+        popd
+
+    - name: Download libv2ray
+      uses: robinraju/release-downloader@v1.13
+      with:
+        repository: '2dust/AndroidLibXrayLite'
+        tag: ${{ env.CURRENT_TAG }}
+        fileName: 'libv2ray.aar'
+        out-file-path: V2rayNG/app/libs/
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Decode keystore
+      env:
+        KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+      run: echo "$KEYSTORE_B64" | base64 -d > $RUNNER_TEMP/release.jks
+
+    - name: Build APK
+      run: |
+        cd ${{ github.workspace }}/V2rayNG
+        echo "sdk.dir=${ANDROID_HOME}" > local.properties
+        chmod 755 gradlew
+        ./gradlew assemblePlaystoreRelease \
+          -Pandroid.injected.signing.store.file=$RUNNER_TEMP/release.jks \
+          -Pandroid.injected.signing.store.password='${{ secrets.KEYSTORE_PASSWORD }}' \
+          -Pandroid.injected.signing.key.alias=hshukur \
+          -Pandroid.injected.signing.key.password='${{ secrets.KEYSTORE_PASSWORD }}'
+        mkdir -p $RUNNER_TEMP/out
+        cp app/build/outputs/apk/playstore/release/*universal*.apk $RUNNER_TEMP/out/hshukurvpn-universal.apk
+        cp app/build/outputs/apk/playstore/release/*arm64-v8a*.apk $RUNNER_TEMP/out/hshukurvpn-arm64.apk
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: hshukurvpn
+        path: ${{ runner.temp }}/out/*.apk
+        
