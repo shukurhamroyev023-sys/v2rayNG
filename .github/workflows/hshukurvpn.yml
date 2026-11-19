@@ -168,11 +168,16 @@ jobs:
       run: |
         PASS=$(printf '%s' "$KEYSTORE_PASSWORD" | tr -d ' \r\n\t')
         echo "::add-mask::$PASS"
-        printf '%s' "$KEYSTORE_B64" | tr -d ' \r\n\t' | base64 -d > $RUNNER_TEMP/release.p12
+        if [ -f release.p12 ]; then
+          echo "Using release.p12 from the repository"
+          cp release.p12 $RUNNER_TEMP/release.p12
+        else
+          printf '%s' "$KEYSTORE_B64" | tr -d ' \r\n\t' | base64 -d > $RUNNER_TEMP/release.p12
+        fi
         echo "Keystore size: $(stat -c %s $RUNNER_TEMP/release.p12) bytes (expected 2570)"
         echo "Password length: ${#PASS} (expected 20)"
         if ! keytool -list -keystore $RUNNER_TEMP/release.p12 -storetype PKCS12 -storepass "$PASS" -alias hshukur; then
-          echo "::error::KEYSTORE_B64 or KEYSTORE_PASSWORD secret is wrong - paste them again"
+          echo "::error::Keystore check failed. Password length is ${#PASS} (must be 20). Re-paste KEYSTORE_PASSWORD"
           exit 1
         fi
         # convert to classic JKS so the Android signer reads it without guessing the type
@@ -201,4 +206,3 @@ jobs:
       with:
         name: hshukurvpn
         path: ${{ runner.temp }}/out/*.apk
-        
